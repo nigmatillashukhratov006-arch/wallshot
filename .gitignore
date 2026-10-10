@@ -3,3 +3,4 @@ build/
 app/build/
 .gradle/
 *.apk
+Claude outputs/
