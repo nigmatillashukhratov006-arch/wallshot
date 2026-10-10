@@ -12,19 +12,43 @@ public class Util {
     static byte[] toNv21(ByteBuffer y, int yRowStride, ByteBuffer u, ByteBuffer v,
                          int uvRowStride, int uvPixelStride, int w, int h) {
         byte[] out = new byte[w * h * 3 / 2];
+        // Y plane: copy whole rows at once (absolute reads, buffer positions untouched).
+        ByteBuffer yd = y.duplicate();
         int pos = 0;
         for (int r = 0; r < h; r++) {
             int start = r * yRowStride;
-            for (int c = 0; c < w; c++) {
-                int idx = start + c;
-                out[pos++] = idx < y.limit() ? y.get(idx) : 0;
+            int n = Math.max(0, Math.min(w, yd.limit() - start));
+            if (n > 0) {
+                yd.position(start);
+                yd.get(out, pos, n);
             }
+            pos += w;
         }
+        // Chroma: read each row once, then interleave V,U for NV21.
+        int cw = w / 2;
+        int rowLen = (cw - 1) * uvPixelStride + 1;
+        byte[] urow = new byte[rowLen];
+        byte[] vrow = new byte[rowLen];
+        ByteBuffer ud = u.duplicate();
+        ByteBuffer vd = v.duplicate();
         for (int r = 0; r < h / 2; r++) {
-            for (int c = 0; c < w / 2; c++) {
-                int idx = r * uvRowStride + c * uvPixelStride;
-                out[pos++] = idx < v.limit() ? v.get(idx) : (byte) 128;
-                out[pos++] = idx < u.limit() ? u.get(idx) : (byte) 128;
+            int start = r * uvRowStride;
+            int nu = Math.max(0, Math.min(rowLen, ud.limit() - start));
+            int nv = Math.max(0, Math.min(rowLen, vd.limit() - start));
+            java.util.Arrays.fill(urow, nu, rowLen, (byte) 128);
+            java.util.Arrays.fill(vrow, nv, rowLen, (byte) 128);
+            if (nu > 0) {
+                ud.position(start);
+                ud.get(urow, 0, nu);
+            }
+            if (nv > 0) {
+                vd.position(start);
+                vd.get(vrow, 0, nv);
+            }
+            for (int c = 0; c < cw; c++) {
+                int i = c * uvPixelStride;
+                out[pos++] = vrow[i];
+                out[pos++] = urow[i];
             }
         }
         return out;

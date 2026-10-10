@@ -1,15 +1,22 @@
 package com.drone.wallshot;
 
+import android.content.Context;
 import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
 import android.media.ExifInterface;
 import android.media.Image;
 import android.media.ImageReader;
-import android.media.MediaPlayer;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Player;
+import androidx.media3.common.VideoSize;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.rtsp.RtspMediaSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -23,8 +30,9 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Plays the camera's RTSP stream into an ImageReader (no screen needed) and, on request, writes the next
- * decoded frame as a JPEG into one or more folders, with GPS EXIF when a position is known.
+ * Plays the camera's RTSP stream with ExoPlayer into an ImageReader (no screen needed) and, on request, writes the
+ * next decoded frame as a JPEG into one or more folders, with GPS EXIF when a position is known.
+ * ExoPlayer's RTSP support covers H264 only (SPS/PPS must be in the stream description).
  */
 public class FrameGrabber {
 
@@ -42,18 +50,28 @@ public class FrameGrabber {
         }
     }
 
+    private final Context ctx;
     private final String url;
+    private final boolean useTcp;
     private final Handler main = new Handler(Looper.getMainLooper());
     private HandlerThread thread;
     private Handler bg;
-    private MediaPlayer player;
+    private ExoPlayer player;
     private ImageReader reader;
+    private int readerW = 0;
+    private int readerH = 0;
     private volatile boolean ready = false;
     private volatile String lastError = "";
+    private volatile String stateText = "starting";
     private volatile Request pending;
+    private volatile boolean stopped = false;
+    private volatile int reconnects = 0;
+    private volatile String lastSaved = "";
 
-    FrameGrabber(String url) {
+    FrameGrabber(Context ctx, String url, boolean useTcp) {
+        this.ctx = ctx.getApplicationContext();
         this.url = url;
+        this.useTcp = useTcp;
     }
 
     boolean isReady() {
@@ -61,8 +79,50 @@ public class FrameGrabber {
     }
 
     String statusText() {
-        if (ready) return lastError.isEmpty() ? "video OK" : "video OK, last error: " + lastError;
-        return lastError.isEmpty() ? "connecting to video..." : lastError;
+        String rc = reconnects > 0 ? " (reconnected " + reconnects + "x)" : "";
+        if (ready) return (lastError.isEmpty() ? "video OK" : "video OK, last error: " + lastError) + rc;
+        return (lastError.isEmpty() ? "connecting to video (" + stateText + ")..." : lastError + ", retrying...") + rc;
+    }
+
+    String lastSaved() {
+        return lastSaved;
+    }
+
+    /** Called on the main thread after an error or end of stream: try again in 3 s until stop() is called. */
+    private void scheduleReconnect() {
+        if (stopped) return;
+        main.postDelayed(() -> {
+            if (stopped || player == null) return;
+            try {
+                reconnects++;
+                stateText = "reconnecting";
+                player.setMediaSource(newSource());
+                player.prepare();
+                player.setPlayWhenReady(true);
+            } catch (Exception e) {
+                lastError = "reconnect failed: " + e.getMessage();
+                scheduleReconnect();
+            }
+        }, 3000);
+    }
+
+    private RtspMediaSource newSource() {
+        return new RtspMediaSource.Factory()
+                .setForceUseRtpTcp(useTcp)
+                .setTimeoutMs(15000)
+                .createMediaSource(MediaItem.fromUri(url));
+    }
+
+    /** Must run on the main thread. Replaces the ImageReader when the real video size differs. */
+    private void ensureReader(int w, int h) {
+        if (reader != null && w == readerW && h == readerH) return;
+        ImageReader old = reader;
+        reader = ImageReader.newInstance(w, h, ImageFormat.YUV_420_888, 3);
+        reader.setOnImageAvailableListener(this::onImage, bg);
+        readerW = w;
+        readerH = h;
+        if (player != null) player.setVideoSurface(reader.getSurface());
+        if (old != null) old.close();
     }
 
     void start() {
@@ -71,31 +131,45 @@ public class FrameGrabber {
         bg = new Handler(thread.getLooper());
         main.post(() -> {
             try {
-                player = new MediaPlayer();
-                player.setDataSource(url);
-                player.setOnPreparedListener(mp -> {
-                    try {
-                        int w = mp.getVideoWidth();
-                        int h = mp.getVideoHeight();
-                        if (w <= 0 || h <= 0) {
-                            lastError = "stream has no video size";
-                            return;
-                        }
-                        reader = ImageReader.newInstance(w, h, ImageFormat.YUV_420_888, 3);
-                        reader.setOnImageAvailableListener(this::onImage, bg);
-                        mp.setSurface(reader.getSurface());
-                        mp.start();
+                ensureReader(1920, 1080);
+                player = new ExoPlayer.Builder(ctx).build();
+                player.addListener(new Player.Listener() {
+                    @Override
+                    public void onVideoSizeChanged(VideoSize size) {
+                        if (size.width > 0 && size.height > 0) ensureReader(size.width, size.height);
+                    }
+
+                    @Override
+                    public void onRenderedFirstFrame() {
                         ready = true;
-                    } catch (Exception e) {
-                        lastError = "video setup failed: " + e.getMessage();
+                        lastError = "";
+                    }
+
+                    @Override
+                    public void onPlaybackStateChanged(int state) {
+                        if (state == Player.STATE_BUFFERING) stateText = "buffering";
+                        else if (state == Player.STATE_READY) stateText = "ready";
+                        else if (state == Player.STATE_ENDED) {
+                            stateText = "ended";
+                            ready = false;
+                            lastError = "stream ended";
+                            scheduleReconnect();
+                        }
+                    }
+
+                    @Override
+                    public void onPlayerError(PlaybackException e) {
+                        ready = false;
+                        Throwable c = e.getCause();
+                        lastError = "video error " + e.getErrorCodeName() + ": " + e.getMessage()
+                                + (c != null && c.getMessage() != null ? " / " + c.getMessage() : "");
+                        scheduleReconnect();
                     }
                 });
-                player.setOnErrorListener((mp, what, extra) -> {
-                    ready = false;
-                    lastError = "video error " + what + "/" + extra;
-                    return true;
-                });
-                player.prepareAsync();
+                player.setMediaSource(newSource());
+                player.setVideoSurface(reader.getSurface());
+                player.prepare();
+                player.setPlayWhenReady(true);
             } catch (Exception e) {
                 lastError = "cannot open " + url + ": " + e.getMessage();
             }
@@ -103,6 +177,7 @@ public class FrameGrabber {
     }
 
     void stop() {
+        stopped = true;
         ready = false;
         pending = null;
         main.post(() -> {
@@ -182,6 +257,7 @@ public class FrameGrabber {
                 }
             }
             req.name = any ? name : null;
+            if (any) lastSaved = name;
         } catch (Exception e) {
             lastError = "convert failed: " + e.getMessage();
         } finally {

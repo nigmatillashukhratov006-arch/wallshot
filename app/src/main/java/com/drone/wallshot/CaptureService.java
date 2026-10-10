@@ -38,6 +38,8 @@ public class CaptureService extends Service {
     static volatile int failed = 0;
     static volatile String logPath = "";
     static volatile String photoPaths = "";
+    static volatile String lastFile = "";
+    static volatile String syncNote = "";
 
     private Thread worker;
     private Thread telemetry;
@@ -96,7 +98,8 @@ public class CaptureService extends Service {
         final boolean distMode = "dist".equals(sp.getString("mode", "time"));
         final boolean camCmd = !"0".equals(sp.getString("camcmd", "1"));
         final String rtsp = sp.getString("rtsp", "rtsp://192.168.144.25:8554/main.264").trim();
-        final String store = sp.getString("store", "internal");
+        final String store = sp.getString("store", "auto");
+        final boolean tcp = !"0".equals(sp.getString("tcp", "1"));
 
         final double spacing = Math.max(0.05, widthM * (1.0 - overlap / 100.0));
         final long intervalMs = (long) (1000.0 * spacing / Math.max(0.01, speed));
@@ -104,9 +107,9 @@ public class CaptureService extends Service {
         final String session = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
         StringBuilder note = new StringBuilder();
         final List<File> dirs = Storage.targets(this, store, session, note);
-        StringBuilder paths = new StringBuilder();
-        for (File d : dirs) paths.append(d.getAbsolutePath()).append('\n');
-        photoPaths = paths.toString().trim();
+        photoPaths = joinPaths(dirs);
+        lastFile = "";
+        syncNote = "";
 
         shots = 0;
         saved = 0;
@@ -115,8 +118,11 @@ public class CaptureService extends Service {
         running = true;
         status = (distMode ? "Waiting for GPS (MAVLink)... " : "Starting... ") + note;
 
+        if (rtsp.isEmpty()) {
+            status = "No video stream URL set, photos cannot be saved. " + note;
+        }
         if (!rtsp.isEmpty() && !dirs.isEmpty()) {
-            grabber = new FrameGrabber(rtsp);
+            grabber = new FrameGrabber(getApplicationContext(), rtsp, tcp);
             grabber.start();
         } else if (dirs.isEmpty()) {
             status = "No folder to save photos into. " + note;
@@ -156,8 +162,18 @@ public class CaptureService extends Service {
                 try (PrintWriter pw = new PrintWriter(new FileWriter(f, true))) {
                     pw.println("n,time_utc,lat,lon,rel_alt_m,heading_deg,camera_ack,frame_saved,file");
                     pw.flush();
+                    // Give the video link time to start, so the first photos are not lost.
+                    if (grabber != null) {
+                        long until = System.currentTimeMillis() + 30000;
+                        while (running && !grabber.isReady() && System.currentTimeMillis() < until) {
+                            status = "Waiting for video before the first photo... " + grabber.statusText();
+                            Thread.sleep(250);
+                        }
+                    }
                     long nextAt = System.currentTimeMillis();
                     double[] lastShotPos = null;
+                    List<File> curDirs = dirs;
+                    long nextDirCheck = 0;
                     while (running) {
                         long now = System.currentTimeMillis();
                         double[] pos = lastPos;
@@ -173,6 +189,14 @@ public class CaptureService extends Service {
                                 fire = true;
                             }
                         }
+                        if (fire && now >= nextDirCheck) {
+                            // Re-check every few seconds: an SD card inserted during the session starts
+                            // receiving copies right away (modes "auto" and "both").
+                            List<File> d2 = Storage.targets(this, store, session, null);
+                            if (!d2.isEmpty()) curDirs = d2;
+                            photoPaths = joinPaths(curDirs);
+                            nextDirCheck = now + 5000;
+                        }
                         if (fire) {
                             boolean ack = false;
                             if (camCmd) {
@@ -185,8 +209,11 @@ public class CaptureService extends Service {
                             shots++;
                             if (distMode && pos != null) lastShotPos = pos;
                             String file = null;
-                            if (grabber != null) file = grabber.saveFrame(shots, pos, dirs);
-                            if (file != null) saved++;
+                            if (grabber != null) file = grabber.saveFrame(shots, pos, curDirs);
+                            if (file != null) {
+                                saved++;
+                                lastFile = file;
+                            }
                             else failed++;
                             String posPart = pos == null
                                     ? ",,,,"
@@ -211,7 +238,14 @@ public class CaptureService extends Service {
         worker.start();
     }
 
+    static String joinPaths(List<File> dirs) {
+        StringBuilder paths = new StringBuilder();
+        for (File d : dirs) paths.append(d.getAbsolutePath()).append('\n');
+        return paths.toString().trim();
+    }
+
     private void stopWork() {
+        boolean wasRunning = running;
         running = false;
         if (worker != null) worker.interrupt();
         DatagramSocket s = mavSocket;
@@ -223,6 +257,15 @@ public class CaptureService extends Service {
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         if (!status.startsWith("Error")) {
             status = String.format(Locale.US, "Stopped. Shots %d, saved %d, failed %d", shots, saved, failed);
+        }
+        // After a session, make sure the SD card has every photo and the CSV log.
+        String store = getSharedPreferences("cfg", Context.MODE_PRIVATE).getString("store", "auto");
+        if (wasRunning && Storage.usesSd(store)) {
+            final Context app = getApplicationContext();
+            new Thread(() -> {
+                Storage.SyncResult r = Storage.syncToSd(app);
+                syncNote = r.noCard ? "" : "SD card copy: " + r;
+            }, "wallshot-sync").start();
         }
     }
 

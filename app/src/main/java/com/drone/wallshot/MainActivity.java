@@ -1,6 +1,7 @@
 package com.drone.wallshot;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -27,10 +28,13 @@ public class MainActivity extends Activity {
 
     private SharedPreferences sp;
     private EditText etD, etAlt, etHfov, etW, etOv, etSpeed, etPath, etIp, etPort, etMav, etRtsp;
-    private RadioButton rbTime, rbDist, rbInternal, rbSd, rbBoth;
-    private CheckBox cbCam;
+    private RadioButton rbTime, rbDist, rbAuto, rbInternal, rbSd, rbBoth;
+    private CheckBox cbCam, cbTcp;
     private TextView tvCalc, tvStatus, tvStore;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private boolean sdWasPresent = false;
+    private boolean syncing = false;
+    private int tick = 0;
 
     private final Runnable refresh = new Runnable() {
         @Override
@@ -51,7 +55,11 @@ public class MainActivity extends Activity {
                     spacing, interval, photos, rowTime));
             String log = CaptureService.logPath.isEmpty() ? "" : "\nLog: " + CaptureService.logPath;
             String where = CaptureService.photoPaths.isEmpty() ? "" : "\nPhotos: " + CaptureService.photoPaths;
-            tvStatus.setText("Status: " + CaptureService.status + where + log);
+            String last = CaptureService.lastFile.isEmpty() ? "" : "\nLast photo: " + CaptureService.lastFile;
+            String sync = CaptureService.syncNote.isEmpty() ? "" : "\n" + CaptureService.syncNote;
+            tvStatus.setText("Status: " + CaptureService.status + last + where + log + sync);
+            // Every 2 s: refresh the storage lines and copy to a newly inserted SD card.
+            if (tick++ % 4 == 0) checkSdCard();
             handler.postDelayed(this, 500);
         }
     };
@@ -93,7 +101,7 @@ public class MainActivity extends Activity {
         scroll.addView(root);
 
         TextView title = new TextView(this);
-        title.setText("WallShot - SIYI A2 Mini wall photo trigger");
+        title.setText("WallShot v1.2 - SIYI A2 Mini wall photo trigger");
         title.setTextSize(20);
         root.addView(title);
 
@@ -109,6 +117,11 @@ public class MainActivity extends Activity {
         etMav = field(root, "MAVLink UDP port (position log / distance mode)", "mav", "14550", true);
         etRtsp = field(root, "Video stream URL (photos are saved from this stream)", "rtsp",
                 "rtsp://192.168.144.25:8554/main.264", false);
+
+        cbTcp = new CheckBox(this);
+        cbTcp.setText("Use RTSP over TCP (turn off if the stream will not open)");
+        cbTcp.setChecked(!"0".equals(sp.getString("tcp", "1")));
+        root.addView(cbTcp);
 
         RadioGroup rg = new RadioGroup(this);
         rbTime = new RadioButton(this);
@@ -126,23 +139,32 @@ public class MainActivity extends Activity {
         saveLabel.setPadding(0, dp(12), 0, 0);
         root.addView(saveLabel);
         RadioGroup rgs = new RadioGroup(this);
+        rbAuto = new RadioButton(this);
+        rbAuto.setText("Automatic: MK15 storage, plus the SD card whenever one is inserted (recommended)");
         rbInternal = new RadioButton(this);
         rbInternal.setText("MK15 internal storage");
         rbSd = new RadioButton(this);
         rbSd.setText("SD card in the MK15");
         rbBoth = new RadioButton(this);
         rbBoth.setText("Both (two copies)");
+        rgs.addView(rbAuto);
         rgs.addView(rbInternal);
         rgs.addView(rbSd);
         rgs.addView(rbBoth);
-        String store = sp.getString("store", "internal");
+        String store = sp.getString("store", "auto");
         if ("sd".equals(store)) rbSd.setChecked(true);
         else if ("both".equals(store)) rbBoth.setChecked(true);
-        else rbInternal.setChecked(true);
+        else if ("internal".equals(store)) rbInternal.setChecked(true);
+        else rbAuto.setChecked(true);
         root.addView(rgs);
 
         tvStore = new TextView(this);
         root.addView(tvStore);
+
+        Button copySd = new Button(this);
+        copySd.setText("Copy all photos to SD card now");
+        copySd.setOnClickListener(v -> copyToSd(true));
+        root.addView(copySd);
 
         cbCam = new CheckBox(this);
         cbCam.setText("Also send the take-photo command to the camera (its own storage, if it has any)");
@@ -154,15 +176,20 @@ public class MainActivity extends Activity {
         tvCalc.setPadding(0, dp(12), 0, dp(12));
         root.addView(tvCalc);
 
+        Button probe = new Button(this);
+        probe.setText("1. Check video stream (RTSP)");
+        probe.setOnClickListener(v -> checkStream());
+        root.addView(probe);
+
+        Button testFrame = new Button(this);
+        testFrame.setText("2. Test video frame save (camera on, up to 25 s)");
+        testFrame.setOnClickListener(v -> testFrameSave());
+        root.addView(testFrame);
+
         Button test = new Button(this);
         test.setText("Test camera command");
         test.setOnClickListener(v -> testPhoto());
         root.addView(test);
-
-        Button testFrame = new Button(this);
-        testFrame.setText("Test video frame save (camera on, up to 25 s)");
-        testFrame.setOnClickListener(v -> testFrameSave());
-        root.addView(testFrame);
 
         Button start = new Button(this);
         start.setText("Start capture");
@@ -193,6 +220,7 @@ public class MainActivity extends Activity {
     }
 
     private String storeMode() {
+        if (rbAuto.isChecked()) return "auto";
         if (rbSd.isChecked()) return "sd";
         if (rbBoth.isChecked()) return "both";
         return "internal";
@@ -211,10 +239,25 @@ public class MainActivity extends Activity {
                 .putString("port", etPort.getText().toString().trim())
                 .putString("mav", etMav.getText().toString().trim())
                 .putString("rtsp", etRtsp.getText().toString().trim())
+                .putString("tcp", cbTcp.isChecked() ? "1" : "0")
                 .putString("mode", rbDist.isChecked() ? "dist" : "time")
                 .putString("store", storeMode())
                 .putString("camcmd", cbCam.isChecked() ? "1" : "0")
                 .apply();
+    }
+
+    /** Shows a selectable, scrollable message so it can be read or photographed. */
+    private void showText(final String title, final String msg) {
+        runOnUiThread(() -> {
+            AlertDialog dialog = new AlertDialog.Builder(this)
+                    .setTitle(title)
+                    .setMessage(msg)
+                    .setPositiveButton("OK", null)
+                    .create();
+            dialog.show();
+            TextView tv = (TextView) dialog.findViewById(android.R.id.message);
+            if (tv != null) tv.setTextIsSelectable(true);
+        });
     }
 
     private void testPhoto() {
@@ -235,14 +278,27 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    /** Asks the camera to describe its video stream and explains the answer. */
+    private void checkStream() {
+        save();
+        final String url = etRtsp.getText().toString().trim();
+        if (url.isEmpty()) {
+            showText("Video stream check", "The video stream URL is empty.");
+            return;
+        }
+        Toast.makeText(this, "Asking the camera about its video stream...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> showText("Video stream check", url + "\n\n" + RtspProbe.probe(url, 5000))).start();
+    }
+
     /** Connects to the video stream, saves one frame to the chosen storage and reports what happened. */
     private void testFrameSave() {
         save();
         final String url = etRtsp.getText().toString().trim();
         final String mode = storeMode();
+        final boolean tcp = cbTcp.isChecked();
         Toast.makeText(this, "Connecting to video, please wait...", Toast.LENGTH_SHORT).show();
         new Thread(() -> {
-            FrameGrabber g = new FrameGrabber(url);
+            FrameGrabber g = new FrameGrabber(getApplicationContext(), url, tcp);
             g.start();
             long end = System.currentTimeMillis() + 25000;
             while (!g.isReady() && System.currentTimeMillis() < end) {
@@ -254,7 +310,7 @@ public class MainActivity extends Activity {
             }
             String msg;
             if (!g.isReady()) {
-                msg = "No video: " + g.statusText();
+                msg = "No video after 25 s.\n" + g.statusText() + "\n\nRTSP over TCP: " + (tcp ? "on" : "off");
             } else {
                 StringBuilder note = new StringBuilder();
                 List<File> dirs = Storage.targets(this, mode, "test", note);
@@ -268,9 +324,41 @@ public class MainActivity extends Activity {
                 }
             }
             g.stop();
-            final String m = msg;
-            runOnUiThread(() -> Toast.makeText(this, m, Toast.LENGTH_LONG).show());
+            showText("Video frame test", msg);
         }).start();
+    }
+
+    /** Updates the storage lines; when a card appears (or at start-up) copies missing photos to it. */
+    private void checkSdCard() {
+        tvStore.setText(Storage.describe(this));
+        boolean present = Storage.sdBase(this) != null;
+        if (present && !sdWasPresent && Storage.usesSd(storeMode()) && !CaptureService.running) {
+            copyToSd(false);
+        }
+        sdWasPresent = present;
+    }
+
+    /** Copies every photo and CSV log from MK15 storage to the SD card (files already there are skipped). */
+    private void copyToSd(boolean userAsked) {
+        if (syncing) {
+            if (userAsked) Toast.makeText(this, "Already copying...", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (Storage.sdBase(this) == null) {
+            if (userAsked) showText("Copy to SD card", "No SD card found. Insert one and try again.");
+            return;
+        }
+        syncing = true;
+        Toast.makeText(this, "Copying photos to the SD card...", Toast.LENGTH_SHORT).show();
+        final Context app = getApplicationContext();
+        new Thread(() -> {
+            Storage.SyncResult r = Storage.syncToSd(app);
+            runOnUiThread(() -> {
+                syncing = false;
+                tvStore.setText(Storage.describe(this));
+                if (userAsked || r.copied > 0 || r.failed > 0) showText("Copy to SD card", r.toString());
+            });
+        }, "wallshot-sync").start();
     }
 
     @Override
