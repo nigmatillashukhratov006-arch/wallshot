@@ -100,11 +100,17 @@ public class CaptureService extends Service {
         final String rtsp = sp.getString("rtsp", "rtsp://192.168.144.25:8554/main.264").trim();
         final String store = sp.getString("store", "auto");
         final boolean tcp = !"0".equals(sp.getString("tcp", "1"));
+        final boolean swDec = !"1".equals(sp.getString("hwdec", "0"));
 
         final double spacing = Math.max(0.05, widthM * (1.0 - overlap / 100.0));
         final long intervalMs = (long) (1000.0 * spacing / Math.max(0.01, speed));
 
-        final String session = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        // Mission name typed by the user = folder name and photo name prefix. Without a name, a date-time folder.
+        final String mission = Storage.cleanName(sp.getString("mission", ""));
+        final String session = mission.isEmpty()
+                ? new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date())
+                : mission;
+        final String prefix = mission.isEmpty() ? "wall" : mission;
         StringBuilder note = new StringBuilder();
         final List<File> dirs = Storage.targets(this, store, session, note);
         photoPaths = joinPaths(dirs);
@@ -122,7 +128,7 @@ public class CaptureService extends Service {
             status = "No video stream URL set, photos cannot be saved. " + note;
         }
         if (!rtsp.isEmpty() && !dirs.isEmpty()) {
-            grabber = new FrameGrabber(getApplicationContext(), rtsp, tcp);
+            grabber = new FrameGrabber(getApplicationContext(), rtsp, tcp, swDec);
             grabber.start();
         } else if (dirs.isEmpty()) {
             status = "No folder to save photos into. " + note;
@@ -156,11 +162,15 @@ public class CaptureService extends Service {
             SimpleDateFormat iso = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
             iso.setTimeZone(TimeZone.getTimeZone("UTC"));
             try {
-                File dir = getExternalFilesDir(null);
-                File f = new File(dir, "wallshot_" + session + ".csv");
+                // The CSV log lives in the mission folder next to its photos (MK15 storage; copied to the card).
+                File dir = dirs.isEmpty() ? getExternalFilesDir(null) : dirs.get(0);
+                File f = new File(dir, prefix + "_log.csv");
+                boolean newLog = !f.exists() || f.length() == 0;
                 logPath = f.getAbsolutePath();
+                // A repeated mission name continues the numbering instead of overwriting photos.
+                final int firstNumber = Storage.lastNumber(dirs, prefix) + 1;
                 try (PrintWriter pw = new PrintWriter(new FileWriter(f, true))) {
-                    pw.println("n,time_utc,lat,lon,rel_alt_m,heading_deg,camera_ack,frame_saved,file");
+                    if (newLog) pw.println("n,time_utc,lat,lon,rel_alt_m,heading_deg,camera_ack,frame_saved,file");
                     pw.flush();
                     // Give the video link time to start, so the first photos are not lost.
                     if (grabber != null) {
@@ -209,7 +219,8 @@ public class CaptureService extends Service {
                             shots++;
                             if (distMode && pos != null) lastShotPos = pos;
                             String file = null;
-                            if (grabber != null) file = grabber.saveFrame(shots, pos, curDirs);
+                            int number = firstNumber + shots - 1;
+                            if (grabber != null) file = grabber.saveFrame(Storage.photoName(prefix, number), pos, curDirs);
                             if (file != null) {
                                 saved++;
                                 lastFile = file;
@@ -218,7 +229,7 @@ public class CaptureService extends Service {
                             String posPart = pos == null
                                     ? ",,,,"
                                     : String.format(Locale.US, "%.7f,%.7f,%.2f,%.1f,", pos[0], pos[1], pos[2], pos[3]);
-                            pw.println(shots + "," + iso.format(new Date()) + "," + posPart + ack + ","
+                            pw.println(number + "," + iso.format(new Date()) + "," + posPart + ack + ","
                                     + (file != null) + "," + (file == null ? "" : file));
                             pw.flush();
                             status = String.format(Locale.US, "Running. Shots %d, saved %d, failed %d. %s",

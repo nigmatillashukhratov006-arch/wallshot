@@ -49,6 +49,47 @@ public class Storage {
         return null;
     }
 
+    /**
+     * Turns what the user typed into a safe folder / file name: letters (any language), digits, '-' and '_'.
+     * Spaces become '_'. Empty result = no name.
+     */
+    static String cleanName(String raw) {
+        if (raw == null) return "";
+        StringBuilder b = new StringBuilder();
+        for (char ch : raw.trim().toCharArray()) {
+            if (Character.isLetterOrDigit(ch) || ch == '-' || ch == '_') b.append(ch);
+            else if (ch == ' ' || ch == '.') b.append('_');
+        }
+        String s = b.toString().replaceAll("_+", "_").replaceAll("^_|_$", "");
+        return s.length() > 48 ? s.substring(0, 48) : s;
+    }
+
+    /** Photo file name for shot number n, e.g. "Library_East_Wall_0007.jpg". */
+    static String photoName(String prefix, int n) {
+        return String.format(Locale.US, "%s_%04d.jpg", prefix, n);
+    }
+
+    /** Highest photo number already in these folders for this prefix, so a repeated mission continues. */
+    static int lastNumber(List<File> dirs, String prefix) {
+        int max = 0;
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                java.util.regex.Pattern.quote(prefix) + "_(\\d{4,})\\.jpg");
+        for (File d : dirs) {
+            String[] names = d.list();
+            if (names == null) continue;
+            for (String n : names) {
+                java.util.regex.Matcher m = p.matcher(n);
+                if (m.matches()) {
+                    try {
+                        max = Math.max(max, Integer.parseInt(m.group(1)));
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            }
+        }
+        return max;
+    }
+
     static File sessionDir(File base, String session) {
         File dir = new File(base, "photos/" + session);
         //noinspection ResultOfMethodCallIgnored
@@ -91,6 +132,7 @@ public class Storage {
         int copied = 0;
         int skipped = 0;
         int failed = 0;
+        int repaired = 0;
         long bytes = 0;
         String error = "";
         boolean noCard = false;
@@ -100,6 +142,7 @@ public class Storage {
             if (noCard) return "SD card not found.";
             String s = String.format(Locale.US, "%d file(s) copied to the SD card (%.1f MB), %d already there",
                     copied, bytes / 1e6, skipped);
+            if (repaired > 0) s += String.format(Locale.US, ", %d damaged copy(ies) replaced", repaired);
             if (failed > 0) s += String.format(Locale.US, ", %d failed (%s)", failed, error);
             return s + ".";
         }
@@ -138,14 +181,13 @@ public class Storage {
     /** CSV logs grow during a session, so they are re-copied when their size changed. */
     private static void copyIfNeeded(File src, File dst, SyncResult r, boolean growing) {
         long len = src.length();
-        if (dst.isFile() && dst.length() == len) {
+        // Skip only real copies: same size AND the same bytes at the start and end. A copy that was damaged
+        // (for example the card was removed before Android finished writing) is replaced.
+        if (dst.isFile() && dst.length() == len && sameEnds(src, dst)) {
             r.skipped++;
             return;
         }
-        if (dst.isFile() && !growing && dst.length() > 0) {
-            r.skipped++;
-            return;
-        }
+        if (dst.isFile() && dst.length() == len) r.repaired++;   // same size, wrong bytes = damaged copy
         File parent = dst.getParentFile();
         if (parent != null) {
             //noinspection ResultOfMethodCallIgnored
@@ -157,6 +199,7 @@ public class Storage {
             int n;
             while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
             os.flush();
+            ((FileOutputStream) os).getFD().sync();   // make sure the data is really on the card
         } catch (IOException e) {
             r.failed++;
             r.error = e.getMessage();
@@ -166,6 +209,13 @@ public class Storage {
         }
         //noinspection ResultOfMethodCallIgnored
         dst.delete();
+        if (tmp.length() != len) {
+            r.failed++;
+            r.error = "copy incomplete";
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+            return;
+        }
         if (tmp.renameTo(dst)) {
             r.copied++;
             r.bytes += len;
@@ -174,6 +224,29 @@ public class Storage {
             r.error = "rename failed";
             //noinspection ResultOfMethodCallIgnored
             tmp.delete();
+        }
+    }
+
+    /** Compares the first and last 64 KB of two files of equal length. */
+    static boolean sameEnds(File a, File b) {
+        long len = a.length();
+        int n = (int) Math.min(65536, len);
+        try (java.io.RandomAccessFile fa = new java.io.RandomAccessFile(a, "r");
+             java.io.RandomAccessFile fb = new java.io.RandomAccessFile(b, "r")) {
+            byte[] x = new byte[n], y = new byte[n];
+            fa.readFully(x);
+            fb.readFully(y);
+            if (!java.util.Arrays.equals(x, y)) return false;
+            if (len > n) {
+                fa.seek(len - n);
+                fb.seek(len - n);
+                fa.readFully(x);
+                fb.readFully(y);
+                if (!java.util.Arrays.equals(x, y)) return false;
+            }
+            return true;
+        } catch (IOException e) {
+            return false;
         }
     }
 

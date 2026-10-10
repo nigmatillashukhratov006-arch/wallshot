@@ -27,10 +27,10 @@ import java.util.Locale;
 public class MainActivity extends Activity {
 
     private SharedPreferences sp;
-    private EditText etD, etAlt, etHfov, etW, etOv, etSpeed, etPath, etIp, etPort, etMav, etRtsp;
+    private EditText etMission, etD, etAlt, etHfov, etW, etOv, etSpeed, etPath, etIp, etPort, etMav, etRtsp;
     private RadioButton rbTime, rbDist, rbAuto, rbInternal, rbSd, rbBoth;
-    private CheckBox cbCam, cbTcp;
-    private TextView tvCalc, tvStatus, tvStore;
+    private CheckBox cbCam, cbTcp, cbHwDec;
+    private TextView tvCalc, tvStatus, tvStore, tvFolder;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean sdWasPresent = false;
     private boolean syncing = false;
@@ -58,6 +58,11 @@ public class MainActivity extends Activity {
             String last = CaptureService.lastFile.isEmpty() ? "" : "\nLast photo: " + CaptureService.lastFile;
             String sync = CaptureService.syncNote.isEmpty() ? "" : "\n" + CaptureService.syncNote;
             tvStatus.setText("Status: " + CaptureService.status + last + where + log + sync);
+            String m = Storage.cleanName(etMission.getText().toString());
+            tvFolder.setText(m.isEmpty()
+                    ? "No name: photos go into a date-time folder, named wall_0001.jpg, wall_0002.jpg, ..."
+                    : "Folder: photos/" + m + "/   Photos: " + Storage.photoName(m, 1) + ", "
+                      + Storage.photoName(m, 2) + ", ...   Log: " + m + "_log.csv");
             // Every 2 s: refresh the storage lines and copy to a newly inserted SD card.
             if (tick++ % 4 == 0) checkSdCard();
             handler.postDelayed(this, 500);
@@ -101,9 +106,14 @@ public class MainActivity extends Activity {
         scroll.addView(root);
 
         TextView title = new TextView(this);
-        title.setText("WallShot v1.2 - SIYI A2 Mini wall photo trigger");
+        title.setText("WallShot v1.4 - SIYI A2 Mini wall photo trigger");
         title.setTextSize(20);
         root.addView(title);
+
+        etMission = field(root, "Mission name (folder and photo names), e.g. Library_East_Wall", "mission", "", false);
+        tvFolder = new TextView(this);
+        tvFolder.setPadding(0, 0, 0, dp(8));
+        root.addView(tvFolder);
 
         etD = field(root, "Standoff from wall (m)", "d", "3.0", true);
         etAlt = field(root, "Flight altitude AGL (m)", "alt", "6.0", true);
@@ -122,6 +132,11 @@ public class MainActivity extends Activity {
         cbTcp.setText("Use RTSP over TCP (turn off if the stream will not open)");
         cbTcp.setChecked(!"0".equals(sp.getString("tcp", "1")));
         root.addView(cbTcp);
+
+        cbHwDec = new CheckBox(this);
+        cbHwDec.setText("Use the hardware video decoder (leave OFF on the MK15: it gives green, scrambled photos)");
+        cbHwDec.setChecked("1".equals(sp.getString("hwdec", "0")));
+        root.addView(cbHwDec);
 
         RadioGroup rg = new RadioGroup(this);
         rbTime = new RadioButton(this);
@@ -228,6 +243,7 @@ public class MainActivity extends Activity {
 
     private void save() {
         sp.edit()
+                .putString("mission", etMission.getText().toString().trim())
                 .putString("d", etD.getText().toString().trim())
                 .putString("alt", etAlt.getText().toString().trim())
                 .putString("hfov", etHfov.getText().toString().trim())
@@ -240,6 +256,7 @@ public class MainActivity extends Activity {
                 .putString("mav", etMav.getText().toString().trim())
                 .putString("rtsp", etRtsp.getText().toString().trim())
                 .putString("tcp", cbTcp.isChecked() ? "1" : "0")
+                .putString("hwdec", cbHwDec.isChecked() ? "1" : "0")
                 .putString("mode", rbDist.isChecked() ? "dist" : "time")
                 .putString("store", storeMode())
                 .putString("camcmd", cbCam.isChecked() ? "1" : "0")
@@ -296,9 +313,10 @@ public class MainActivity extends Activity {
         final String url = etRtsp.getText().toString().trim();
         final String mode = storeMode();
         final boolean tcp = cbTcp.isChecked();
+        final boolean sw = !cbHwDec.isChecked();
         Toast.makeText(this, "Connecting to video, please wait...", Toast.LENGTH_SHORT).show();
         new Thread(() -> {
-            FrameGrabber g = new FrameGrabber(getApplicationContext(), url, tcp);
+            FrameGrabber g = new FrameGrabber(getApplicationContext(), url, tcp, sw);
             g.start();
             long end = System.currentTimeMillis() + 25000;
             while (!g.isReady() && System.currentTimeMillis() < end) {
@@ -313,12 +331,15 @@ public class MainActivity extends Activity {
                 msg = "No video after 25 s.\n" + g.statusText() + "\n\nRTSP over TCP: " + (tcp ? "on" : "off");
             } else {
                 StringBuilder note = new StringBuilder();
-                List<File> dirs = Storage.targets(this, mode, "test", note);
-                String name = dirs.isEmpty() ? null : g.saveFrame(0, null, dirs);
+                // Test photos are kept apart from mission folders.
+                List<File> dirs = Storage.targets(this, mode, "_test", note);
+                String testName = "test_" + new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+                        .format(new java.util.Date()) + ".jpg";
+                String name = dirs.isEmpty() ? null : g.saveFrame(testName, null, dirs);
                 if (name != null) {
                     StringBuilder where = new StringBuilder();
                     for (File d : dirs) where.append('\n').append(d.getAbsolutePath());
-                    msg = "Saved " + name + " to:" + where + "\n" + note;
+                    msg = "Saved " + name + " to:" + where + "\n" + note + "\n\n" + g.frameCheck();
                 } else {
                     msg = "Video is up but saving failed: " + g.statusText() + " " + note;
                 }

@@ -1,4 +1,4 @@
-# WallShot v1.2
+# WallShot v1.4
 
 Android app for the SIYI MK15. On every trigger (by time or by distance) it saves a full frame from the
 camera's video stream as a JPEG on the MK15, in internal storage, on the SD card, or on both. It can also send
@@ -10,6 +10,47 @@ saved because the video player failed with "video error 1/-2147483648" (Android'
 camera's RTSP stream). v1.1 replaced that player with ExoPlayer and added a stream-check button. v1.2 adds the
 automatic SD card copy and makes the video link more robust. v1.2 has been type-checked and its storage and
 frame-conversion code tested off the device; it has not been run on an MK15 yet.
+
+## What changed in v1.4: mission names, tidy folders
+- New **Mission name** field at the top (for example `Library_East_Wall`). The line under it shows exactly where
+  the photos will go.
+- Everything from a mission goes into one folder with that name, on the MK15 and on the SD card:
+
+  ```
+  photos/Library_East_Wall/
+      Library_East_Wall_0001.jpg
+      Library_East_Wall_0002.jpg
+      ...
+      Library_East_Wall_log.csv
+  ```
+- Running the same mission name again continues the numbering (_0043, _0044, ...) and appends to the same log;
+  nothing is overwritten. Use a new name for a new wall.
+- Spaces become `_`; only letters (any language), digits, `-` and `_` are kept; max 48 characters.
+- Without a name, photos go into a date-time folder as `wall_0001.jpg`, `wall_0002.jpg`, ...
+- Test photos ("2. Test video frame save") go into `photos/_test/`, away from mission folders.
+- Date and time of each photo are in its EXIF data and in the CSV log (no longer in the file name).
+
+## What changed in v1.3
+- Field test of v1.2.1 on the MK15: photos were saved (1280 x 720) but showed green, scrambled stripes. The MK15's
+  hardware H.264 decoder writes frames in a compressed vendor layout that cannot be read as normal YUV.
+- The app now uses Android's software H.264 decoder by default (it always writes plain YUV). The hardware
+  decoder can still be chosen with the checkbox "Use the hardware video decoder"; leave it OFF on the MK15.
+- The test pop-up names the decoder in use and checks the saved frame: "looks like a normal picture" or
+  "SCRAMBLED". The check measures how much brightness jumps between neighbouring rows (real frames 2-10,
+  the scrambled MK15 frames 28-35, warning above 20). Photos are kept either way; the status line warns.
+- If the software decoder also gives scrambled frames, report the pop-up text: the next step is to read frames
+  through the GPU (OpenGL) instead.
+
+## What changed in v1.2.1
+- First field test of v1.2: photos were saved, but the copies on the SD card could not be opened. The card's file
+  system had recorded the files without their data (the card was removed before Android finished writing).
+- Every photo is now forced onto the physical storage (fsync) and written as `.part` first, then renamed, so a
+  file with a `.jpg` name is always complete. A photo only counts as "saved" after that.
+- GPS/date EXIF is added before the photo reaches the SD card, so the card only ever receives one finished write.
+- The copy to the SD card now compares contents, not only sizes: damaged copies already on the card are
+  replaced automatically (the report says "damaged copy replaced").
+- **Always eject the SD card on the MK15 before removing it** (Settings > Storage > SD card > Eject), and wait a
+  few seconds after pressing Stop capture.
 
 ## What changed in v1.2
 - **New default save mode "Automatic"**: every photo is saved to MK15 internal storage, and also to the SD card
@@ -37,20 +78,22 @@ frame-conversion code tested off the device; it has not been run on an MK15 yet.
 - Stream address: `rtsp://192.168.144.25:8554/main.264` (main stream) or `.../sub.264` (sub stream).
 
 ## Where the photos go
+`<mission>` is the mission name you typed (or a date-time if empty).
+
 | Choice in the app | Folder |
 |---|---|
 | Automatic (default) | MK15 internal storage always, plus the SD card whenever one is inserted (folders below) |
-| MK15 internal storage | `/storage/emulated/0/Android/data/com.drone.wallshot/files/photos/<session>/` |
-| SD card in the MK15 | `<SD card>/Android/data/com.drone.wallshot/files/photos/<session>/` |
+| MK15 internal storage | `/storage/emulated/0/Android/data/com.drone.wallshot/files/photos/<mission>/` |
+| SD card in the MK15 | `<SD card>/Android/data/com.drone.wallshot/files/photos/<mission>/` |
 | Both | the two folders above, same file names |
 
 - The app shows the exact paths and free space at the top of the screen, and "SD card: NOT FOUND" if Android
   does not see a card. If you pick the SD card but none is found, the app saves to internal storage instead
   and says so.
-- Files are named `wall_0001_<date>_<time>.jpg`, with GPS in the EXIF when a MAVLink position was available.
+- Files are named `<mission>_0001.jpg`, with date/time and (when a MAVLink position was available) GPS in the EXIF.
 - To copy the photos: connect the MK15 to a PC by USB (file transfer mode) and open the folder above, or take
   the SD card out and read it in a card reader. The folder is removed if you uninstall the app, so copy first.
-- The CSV log is in `/storage/emulated/0/Android/data/com.drone.wallshot/files/`.
+- The CSV log `<mission>_log.csv` is in the same folder as the photos.
 
 ## Defaults (80% forward overlap, 0.3 m/s)
 | Setting | Default |

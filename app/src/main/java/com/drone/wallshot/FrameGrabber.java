@@ -15,7 +15,11 @@ import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.VideoSize;
+import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.analytics.AnalyticsListener;
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.media3.exoplayer.rtsp.RtspMediaSource;
 
 import java.io.ByteArrayOutputStream;
@@ -23,6 +27,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -37,14 +42,14 @@ import java.util.concurrent.TimeUnit;
 public class FrameGrabber {
 
     private static class Request {
-        final int n;
+        final String fileName;
         final double[] pos;
         final List<File> dirs;
         final CountDownLatch done = new CountDownLatch(1);
         volatile String name = null;
 
-        Request(int n, double[] pos, List<File> dirs) {
-            this.n = n;
+        Request(String fileName, double[] pos, List<File> dirs) {
+            this.fileName = fileName;
             this.pos = pos;
             this.dirs = dirs;
         }
@@ -53,6 +58,11 @@ public class FrameGrabber {
     private final Context ctx;
     private final String url;
     private final boolean useTcp;
+    private final boolean softwareDecoder;
+    private volatile String decoderName = "";
+    private volatile double lastRoughness = -1;
+    private volatile String lastSize = "";
+    private volatile int scrambled = 0;
     private final Handler main = new Handler(Looper.getMainLooper());
     private HandlerThread thread;
     private Handler bg;
@@ -69,9 +79,37 @@ public class FrameGrabber {
     private volatile String lastSaved = "";
 
     FrameGrabber(Context ctx, String url, boolean useTcp) {
+        this(ctx, url, useTcp, true);
+    }
+
+    /**
+     * softwareDecoder = true prefers Android's software H.264 decoder. Hardware decoders on some controllers
+     * (seen on the MK15) write frames in a compressed vendor layout that cannot be read as YUV, which gives
+     * green, scrambled photos. The software decoder always writes plain YUV.
+     */
+    FrameGrabber(Context ctx, String url, boolean useTcp, boolean softwareDecoder) {
         this.ctx = ctx.getApplicationContext();
         this.url = url;
         this.useTcp = useTcp;
+        this.softwareDecoder = softwareDecoder;
+    }
+
+    String decoderName() {
+        return decoderName;
+    }
+
+    /** Plain-words check of the last saved frame, for the test pop-up. */
+    String frameCheck() {
+        if (lastRoughness < 0) return "";
+        String verdict = lastRoughness > Util.SCRAMBLED_ROUGHNESS
+                ? "SCRAMBLED - the decoder writes a layout the app cannot read. Change the decoder setting and test again."
+                : "looks like a normal picture.";
+        return String.format(Locale.US, "Frame %s, decoder %s, row difference %.1f: %s",
+                lastSize, decoderName.isEmpty() ? "?" : decoderName, lastRoughness, verdict);
+    }
+
+    int scrambledCount() {
+        return scrambled;
     }
 
     boolean isReady() {
@@ -79,7 +117,8 @@ public class FrameGrabber {
     }
 
     String statusText() {
-        String rc = reconnects > 0 ? " (reconnected " + reconnects + "x)" : "";
+        String rc = (reconnects > 0 ? " (reconnected " + reconnects + "x)" : "")
+                + (decoderName.isEmpty() ? "" : " [decoder " + decoderName + "]");
         if (ready) return (lastError.isEmpty() ? "video OK" : "video OK, last error: " + lastError) + rc;
         return (lastError.isEmpty() ? "connecting to video (" + stateText + ")..." : lastError + ", retrying...") + rc;
     }
@@ -132,7 +171,25 @@ public class FrameGrabber {
         main.post(() -> {
             try {
                 ensureReader(1920, 1080);
-                player = new ExoPlayer.Builder(ctx).build();
+                MediaCodecSelector selector = (mime, secure, tunneling) -> {
+                    List<MediaCodecInfo> all =
+                            new ArrayList<>(MediaCodecSelector.DEFAULT.getDecoderInfos(mime, secure, tunneling));
+                    // Stable sort: preferred kind first, the other kind kept as fallback.
+                    all.sort((a, b) -> Boolean.compare(a.softwareOnly != softwareDecoder,
+                            b.softwareOnly != softwareDecoder));
+                    return all;
+                };
+                DefaultRenderersFactory rf = new DefaultRenderersFactory(ctx)
+                        .setMediaCodecSelector(selector)
+                        .setEnableDecoderFallback(true);
+                player = new ExoPlayer.Builder(ctx, rf).build();
+                player.addAnalyticsListener(new AnalyticsListener() {
+                    @Override
+                    public void onVideoDecoderInitialized(AnalyticsListener.EventTime t, String name,
+                                                          long initializedTimestampMs, long initializationDurationMs) {
+                        decoderName = name;
+                    }
+                });
                 player.addListener(new Player.Listener() {
                     @Override
                     public void onVideoSizeChanged(VideoSize size) {
@@ -193,10 +250,10 @@ public class FrameGrabber {
         });
     }
 
-    /** Blocks (max 2.5 s) until the next frame is saved. Returns the file name, or null on failure. */
-    String saveFrame(int n, double[] pos, List<File> dirs) {
+    /** Blocks (max 2.5 s) until the next frame is saved as fileName. Returns the file name, or null on failure. */
+    String saveFrame(String fileName, double[] pos, List<File> dirs) {
         if (!ready) return null;
-        Request req = new Request(n, pos, dirs);
+        Request req = new Request(fileName, pos, dirs);
         pending = req;
         try {
             if (!req.done.await(2500, TimeUnit.MILLISECONDS)) {
@@ -234,26 +291,48 @@ public class FrameGrabber {
             Image.Plane[] p = img.getPlanes();
             byte[] nv21 = Util.toNv21(p[0].getBuffer(), p[0].getRowStride(),
                     p[1].getBuffer(), p[2].getBuffer(), p[1].getRowStride(), p[1].getPixelStride(), w, h);
+            lastRoughness = Util.rowRoughness(nv21, w, h);
+            lastSize = w + "x" + h;
+            if (lastRoughness > Util.SCRAMBLED_ROUGHNESS) {
+                scrambled++;
+                lastError = String.format(Locale.US,
+                        "PHOTOS LOOK SCRAMBLED (row difference %.0f, decoder %s). Change the decoder setting",
+                        lastRoughness, decoderName.isEmpty() ? "?" : decoderName);
+            }
             ByteArrayOutputStream bos = new ByteArrayOutputStream(600 * 1024);
             new YuvImage(nv21, ImageFormat.NV21, w, h, null).compressToJpeg(new Rect(0, 0, w, h), 95, bos);
             byte[] jpg = bos.toByteArray();
-            String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-            String name = String.format(Locale.US, "wall_%04d_%s.jpg", req.n, stamp);
+            if (jpg.length < 1000 || (jpg[0] & 0xff) != 0xFF || (jpg[1] & 0xff) != 0xD8) {
+                throw new IOException("encoder produced no JPEG (" + jpg.length + " bytes)");
+            }
+            String name = req.fileName;
+            // Add EXIF once, in a temporary file on internal storage, so the SD card only ever receives a
+            // finished JPEG in a single write (rewriting files on SD cards is where corruption happens).
+            try {
+                File tmp = File.createTempFile("frame", ".jpg", ctx.getCacheDir());
+                try {
+                    writeSynced(tmp, jpg);
+                    tagExif(tmp, req.pos);
+                    jpg = readAll(tmp);
+                } finally {
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
+                }
+            } catch (Exception e) {
+                lastError = "EXIF failed (photo kept without GPS): " + e.getMessage();
+            }
             boolean any = false;
             for (File dir : req.dirs) {
                 File f = new File(dir, name);
-                try (FileOutputStream fo = new FileOutputStream(f)) {
-                    fo.write(jpg);
-                    fo.flush();
+                File part = new File(dir, name + ".part");
+                try {
+                    writeSynced(part, jpg);
+                    if (!part.renameTo(f)) throw new IOException("rename failed");
                     any = true;
                 } catch (IOException e) {
-                    lastError = "write failed: " + e.getMessage();
-                    continue;
-                }
-                try {
-                    tagExif(f, req.pos);
-                } catch (Exception e) {
-                    lastError = "EXIF failed (photo kept): " + e.getMessage();
+                    lastError = "write failed in " + dir.getAbsolutePath() + ": " + e.getMessage();
+                    //noinspection ResultOfMethodCallIgnored
+                    part.delete();
                 }
             }
             req.name = any ? name : null;
@@ -263,6 +342,28 @@ public class FrameGrabber {
         } finally {
             req.done.countDown();
         }
+    }
+
+    /** Writes the bytes and forces them onto the physical storage before returning. */
+    static void writeSynced(File f, byte[] data) throws IOException {
+        try (FileOutputStream fo = new FileOutputStream(f)) {
+            fo.write(data);
+            fo.flush();
+            fo.getFD().sync();
+        }
+    }
+
+    private static byte[] readAll(File f) throws IOException {
+        byte[] b = new byte[(int) f.length()];
+        try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
+            int off = 0;
+            while (off < b.length) {
+                int n = in.read(b, off, b.length - off);
+                if (n < 0) break;
+                off += n;
+            }
+        }
+        return b;
     }
 
     private static void tagExif(File f, double[] pos) throws IOException {

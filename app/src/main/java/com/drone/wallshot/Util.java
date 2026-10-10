@@ -54,6 +54,26 @@ public class Util {
         return out;
     }
 
+    /**
+     * Mean absolute brightness difference between neighbouring rows, sampled. Real camera frames are smooth
+     * (typically 2-10); frames read from a compressed hardware-decoder layout measure 25-35.
+     */
+    static final double SCRAMBLED_ROUGHNESS = 20.0;
+
+    static double rowRoughness(byte[] yPlane, int w, int h) {
+        long sum = 0;
+        long n = 0;
+        for (int r = 0; r + 1 < h; r += 4) {
+            int a = r * w;
+            int b = a + w;
+            for (int c = 0; c < w; c += 4) {
+                sum += Math.abs((yPlane[a + c] & 0xff) - (yPlane[b + c] & 0xff));
+                n++;
+            }
+        }
+        return n == 0 ? 0 : (double) sum / n;
+    }
+
     /** Degrees to the EXIF rational string "d/1,m/1,s/10000" (sign is stored separately in the REF tag). */
     static String gpsRational(double deg) {
         deg = Math.abs(deg);
